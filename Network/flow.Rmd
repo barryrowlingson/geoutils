@@ -1,0 +1,166 @@
+
+Running Up That Hill
+======================
+
+Barry Rowlingson
+-------------------
+
+After figuring out how to make `igraph` network structures from lines I turned my thoughts to creating flow networks from river lines.
+
+Often you'll get a shapefile of river data with neither topology nor flow direction. This prevents you answering questions such as:
+
+ * A river is polluted at some given point. Identify all the downstream polluted areas.
+ * Pollution is detected at some point. Identify all the upstream tributaries that the pollution may have come from.
+
+By overlaying the river network on a digital elevation model (DEM) it should be possible to work out which way river segments flow.
+
+
+```{r echo=FALSE}
+set.seed(310366)
+options(warn=-1)
+opts_chunk$set(tidy=TRUE,cache=TRUE)
+riverDataDir = "/home/rowlings/Work/R/UseR/UseR2012/Tutorial/Data"
+lakeDataDir = "/home/rowlings/Work/R/UseR/UseR2012/Tutorial/Data/"
+demDataDir = "/home/rowlings/Downloads"
+```
+
+Requirements
+--------------
+
+We need some packages
+
+```{r warning=FALSE,message=FALSE,results="hide"}
+require(igraph)
+require(sp)
+require(rgdal)
+require(raster)
+require(rgeos)
+```
+
+Data
+------
+
+My map data is stored in a few different directories. The river and lake data comes from GeoFabrik's Cumbria shapefile, which is derived from OpenStreetMap sources. The digital elevation model is from NASA's SRTM project. All this data is freely available.
+
+```{r readData}
+rivers = readOGR(riverDataDir,"rivers")
+lakes = readOGR(lakeDataDir,"naturalwater")
+dem = raster(file.path(demDataDir,"cumbriaDem.tif"))
+```
+
+We need to work in a single projection, so we transform the vector data to the projection of the raster. This is a Lambert Equal Area projection in metres.
+
+```{r projections}
+projection(dem)
+lakesP = spTransform(lakes,CRS(projection(dem)))
+riversP = spTransform(rivers,CRS(projection(dem)))
+```
+
+Joining Lakes and Rivers
+--------------------------
+
+When plotting the rivers you will notice big gaps where the lakes are. This is going to interrupt our graph network. One way round this is to incorporate the lake edges into the network by adding them to the rivers to create one larger `SpatialLines` object. Any routing through the lake will choose a path round the edge of the lake. Ideally you might want to create a single network vertex for the lake and join the incoming and outgoing streams to this.
+
+
+There are a lot of small lakes - mostly ponds and mountain tarns - in the lakes shapefile, and these don't affect teh river network. A bit of trial and error helps us find an area threshold that takes out these features. We then plot our new water data - a `SpatialLines` object - on top of the digital elevation model.
+
+```{r lakethin}
+joinLR <- function(lakes,rivers,lakesize){
+  area = gArea(lakes,byid=TRUE)
+  lakes = lakes[area>lakesize,]
+  lakelines = as(lakes,"SpatialLines")
+  water = gUnion(lakelines,rivers)
+  return(water)
+}
+
+water = joinLR(lakesP,riversP,2e5)
+
+plot(dem)
+lines(water)
+```
+
+
+Making The Network
+--------------------
+
+We will use the same functions as before to build the topology and connectivity of the network.
+
+```{r buildtopo}
+buildTopo = function(lines) {
+
+    g = gIntersection(lines, lines)
+    edges = do.call(rbind, lapply(g@lines[[1]]@Lines, function(ls) {
+        as.vector(t(ls@coords))
+    }))
+    lengths = sqrt((edges[, 1] - edges[, 3])^2 + (edges[, 2] - edges[, 4])^2)
+
+    froms = paste(edges[, 1], edges[, 2])
+    tos = paste(edges[, 3], edges[, 4])
+
+    graph = graph.edgelist(cbind(froms, tos), directed = FALSE)
+    E(graph)$weight = lengths
+
+    xy = do.call(rbind, strsplit(V(graph)$name, " "))
+
+    V(graph)$x = as.numeric(xy[, 1])
+    V(graph)$y = as.numeric(xy[, 2])
+    return(graph)
+}
+
+plotRoute <-
+function(graph, nodes, add=FALSE,...) {
+ if(add){
+    lines(V(graph)[nodes]$x, V(graph)[nodes]$y, ...)
+ } else {
+    plot(V(graph)[nodes]$x, V(graph)[nodes]$y, type="l", ...)
+ }
+}
+
+g = buildTopo(water)
+```
+
+Extracting The Heights
+------------------------
+
+Assigning the elevation of the DEM to each node is simple a matter of using the `extract` function of the `raster` package.
+
+```{r heights}
+xy = cbind(V(g)$x,V(g)$y)
+z=extract(dem,xy)
+V(g)$z=z
+```
+
+We now have a three-dimensional network of rivers.
+
+River Height Profile
+----------------------
+
+We can investigate how the altitude of a river changes as it flows downstream.
+
+As long as the river network is a tree then if we choose an upland start point and the river mouth as end point we should find that the shortest route is also the downhill route of the river. We'll choose two points to follow Langstrath Beck as it passes through two lakes to become the Derwent River which meets the sea at Whitehaven.
+
+```{r langstrath}
+from = cbind(3475014, 3562463)
+to = cbind( 3452108, 3586383)
+pp = routePoints(g,from,to)
+plotRoute(g,pp,col="blue",lwd=2,asp=1,xlab="",ylab="")
+plot(water,add=TRUE)
+```
+
+To plot the altitude against distance we simply compute the cumulative pythagorean distance of the nodes of the route against the altitude obtained from sampling the DEM.
+
+
+```{r elevationPlot}
+dpath = c(0,cumsum(sqrt(diff(V(g)[pp]$x)^2 + diff(V(g)[pp]$y)^2)))
+plot(dpath/1000,V(g)[pp]$z,type="l",xlab="distance/m",ylab="height above sea level/km")
+```
+
+Oh dear. This river clearly flows uphill. Sometimes as much as 25 metres. Rivers don't do this, so it must be errors in the DEM or the river line.
+
+One thing that can be seen is the overall change in behaviour of the river. At the start the small stream tumbles steeply down the mountains, then reaches a middle region where it flows into the lakes. These lakes can be seen as two flat-bottomed parts of the profile at about 12km and 25km. After leaving the second lake, and now a river, it rolls gently down to the sea.
+
+Deriving a Flow Network
+-------------------------
+
+Can we derive a flow network from this data? Obviously this plot shows that line segments seem to go up as well as down. We might get something more usable by smoothing the DEM or the sampled heights. Another possibility is to not sample at every point, but to ignore nodes with two edges, since any flow along a series of nodes with two edges has to be in the same direction. By only testing the heights at the nodes that occur at confluences, we will be sampling over a larger drop and hopefully the noise in the DEM won't be enough to affect the resulting direction. This will probably be the subject of the next chapter.
+
